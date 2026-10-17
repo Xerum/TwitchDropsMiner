@@ -5,6 +5,7 @@ import asyncio
 import logging
 from time import time
 from copy import deepcopy
+from base64 import b64encode
 from itertools import chain
 from functools import partial
 from collections import abc, deque, OrderedDict
@@ -34,6 +35,7 @@ from utils import (
     CHARS_HEX_LOWER,
     chunk,
     timestamp,
+    json_minify,
     create_nonce,
     task_wrapper,
     RateLimiter,
@@ -644,6 +646,7 @@ class Twitch:
         # fork: watch idle channels when there's nothing to mine
         if self._idle_task is not None:
             self._idle_task.cancel()
+        self._idle_spade_failed = False
         self._idle_task = asyncio.create_task(self._idle_loop())
         full_cleanup: bool = False
         channels: Final[OrderedDict[int, Channel]] = self.channels
@@ -924,10 +927,12 @@ class Twitch:
             succeeded: bool = await channel.send_watch()
             if not succeeded:
                 logger.log(CALL, f"Watch requested failed for channel: {channel.name}")
-            if self.is_idle_channel(channel):
-                # fork: there's no drop progress to track, but report the watch time
-                # the way the web player does, for the channel points
+            if any(channel.id == idle_channel.id for idle_channel, _game in self._idle_channels):
+                # fork: report the watch time the way the web player does, for the channel points
+                # NOTE: this includes an idle channel that's being watched for a drop
                 await self._send_idle_spade(channel)
+            if self.is_idle_channel(channel):
+                # fork: there's no drop progress to track
                 await self._watch_sleep(interval - min(time() - last_sent, interval))
                 continue
             # wait ~15 seconds for a progress update
@@ -1117,10 +1122,32 @@ class Twitch:
         asyncio.create_task(self.claim_available_points(channel))
 
     async def _send_idle_spade(self, channel: Channel) -> None:
-        if self._idle_spade_failed:
+        # NOTE: The playlist requests alone don't earn channel points, a "minute-watched" event
+        # like the web player sends does. The drop mining payload (with game etc.) doesn't work.
+        if self._idle_spade_failed or (stream := channel._stream) is None:
             return
+        payload: list[JsonType] = [
+            {
+                "event": "minute-watched",
+                "properties": {
+                    "channel_id": str(channel.id),
+                    "broadcast_id": str(stream.broadcast_id),
+                    "player": "site",
+                    "user_id": self._auth_state.user_id,
+                    "live": True,
+                    "channel": channel._login,
+                }
+            }
+        ]
         try:
-            succeeded: bool = await channel._send_watch_spade()
+            if channel._spade_url is None:
+                channel._spade_url = await channel.get_spade_url()
+            async with self.request(
+                "POST",
+                channel._spade_url,
+                data={"data": b64encode(json_minify(payload).encode("utf8")).decode("utf8")},
+            ) as response:
+                succeeded: bool = response.status == 204
         except (ExitRequest, ReloadRequest):
             raise
         except Exception as exc:
