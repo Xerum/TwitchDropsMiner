@@ -1,5 +1,24 @@
 # Twitch Drops Miner
 
+> [!NOTE]
+> **This is a personal fork of [DevilXD/TwitchDropsMiner](https://github.com/DevilXD/TwitchDropsMiner).**
+> It's synced with the original daily and adds the options below. For everything else, see the original
+> project, and please don't report problems of this fork there.
+>
+> **Additional settings** (in `settings.json` only, there's no GUI for them):
+>
+> - `"unlinked_campaigns": true` – also mine campaigns of games whose account isn't linked to Twitch.
+>   Twitch still counts the progress, but the reward may only arrive once the account is linked.
+> - `"idle_channels": ["login", "login:Game name"]` – channels to watch for channel points and watch time
+>   when there's nothing to mine. The first live entry wins, optionally only while streaming the given game.
+>   While mining, they're preferred among the channels of the same game, as long as their stream has drops.
+>   Channel points are only earned on these channels, regular drop mining doesn't earn any.
+>
+> Channel points bonus chests are claimed automatically.
+>
+> **Builds:** [`dev-build` release](https://github.com/Xerum/TwitchDropsMiner/releases/tag/dev-build),
+> rebuilt automatically after every change.
+
 This application allows you to AFK mine timed Twitch drops, without having to worry about switching channels when the one you were watching goes offline, claiming the drops, or even receiving the stream data itself. This helps you save on bandwidth and hassle.
 
 ### How It Works:
