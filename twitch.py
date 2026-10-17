@@ -48,6 +48,7 @@ from constants import (
     MAX_CHANNELS,
     GQL_QUERIES,
     WATCH_INTERVAL,
+    IDLE_CHECK_INTERVAL,
     State,
     ClientType,
     PriorityMode,
@@ -459,6 +460,10 @@ class Twitch:
         self.websocket = WebsocketPool(self)
         # Maintenance task
         self._mnt_task: asyncio.Task[None] | None = None
+        # fork: idle channels (with an optional game filter) and their checking task
+        self._idle_channels: list[tuple[Channel, str | None]] = []
+        self._idle_task: asyncio.Task[None] | None = None
+        self._idle_spade_failed: bool = False
 
     async def get_session(self) -> aiohttp.ClientSession:
         if (session := self._session) is not None:
@@ -504,6 +509,10 @@ class Twitch:
         if self._mnt_task is not None:
             self._mnt_task.cancel()
             self._mnt_task = None
+        if self._idle_task is not None:
+            self._idle_task.cancel()
+            self._idle_task = None
+        self._idle_channels.clear()
         # stop websocket, close session and save cookies
         await self.websocket.stop(clear_topics=True)
         if self._session is not None:
@@ -627,7 +636,15 @@ class Twitch:
             WebsocketTopic(
                 "User", "Notifications", auth_state.user_id, self.process_notifications
             ),
+            # fork: claim channel points bonuses
+            WebsocketTopic(
+                "User", "CommunityPoints", auth_state.user_id, self.process_points
+            ),
         ])
+        # fork: watch idle channels when there's nothing to mine
+        if self._idle_task is not None:
+            self._idle_task.cancel()
+        self._idle_task = asyncio.create_task(self._idle_loop())
         full_cleanup: bool = False
         channels: Final[OrderedDict[int, Channel]] = self.channels
         self.change_state(State.INVENTORY_FETCH)
@@ -639,6 +656,8 @@ class Twitch:
                 self.gui.tray.change_icon("idle")
                 self.gui.status.update(_("gui", "status", "idle"))
                 self.stop_watching()
+                # fork: fall back to an idle channel, if one is live
+                self.update_idle_watching()
                 # clear the flag and wait until it's set again
                 self._state_change.clear()
             elif self._state is State.INVENTORY_FETCH:
@@ -905,6 +924,12 @@ class Twitch:
             succeeded: bool = await channel.send_watch()
             if not succeeded:
                 logger.log(CALL, f"Watch requested failed for channel: {channel.name}")
+            if self.is_idle_channel(channel):
+                # fork: there's no drop progress to track, but report the watch time
+                # the way the web player does, for the channel points
+                await self._send_idle_spade(channel)
+                await self._watch_sleep(interval - min(time() - last_sent, interval))
+                continue
             # wait ~15 seconds for a progress update
             await asyncio.sleep(15 - min(time() - last_sent, 15))
             if self.gui.progress.minute_almost_done():
@@ -1048,6 +1073,108 @@ class Twitch:
         self.gui.progress.stop_timer()
         self._watching_restart.set()
 
+    # fork: idle channels, watched for channel points and watch time when there's nothing to mine
+    def is_idle_channel(self, channel: Channel) -> bool:
+        # NOTE: identity check, the channel list may hold a separate object for the same channel
+        return any(channel is idle_channel for idle_channel, _game in self._idle_channels)
+
+    def _idle_target(self) -> Channel | None:
+        # the first live idle channel that streams the wanted game (if specified) wins
+        for channel, game_name in self._idle_channels:
+            if not channel.online:
+                continue
+            if game_name is None or (
+                channel.game is not None and channel.game.name.casefold() == game_name.casefold()
+            ):
+                return channel
+        return None
+
+    def update_idle_watching(self) -> None:
+        if self._state is not State.IDLE or not self._idle_channels:
+            return
+        watching_channel = self.watching_channel.get_with_default(None)
+        if watching_channel is not None and not self.is_idle_channel(watching_channel):
+            # we're mining a drop
+            return
+        target = self._idle_target()
+        if target is None:
+            if watching_channel is not None:
+                logger.info(f"Idle channel can't be watched anymore: {watching_channel.name}")
+                self.stop_watching()
+        elif target is not watching_channel:
+            self.watch_idle(target)
+
+    def watch_idle(self, channel: Channel) -> None:
+        # NOTE: idle channels aren't on the channel list, so it can't mark them as watched
+        self.gui.tray.change_icon("active")
+        self.gui.channels.clear_watching()
+        self.watching_channel.set(channel)
+        status_text = f"Watching idle channel: {channel.name}"
+        logger.info(status_text)
+        self.print(status_text)
+        self.gui.status.update(status_text)
+        # a bonus may still be waiting from an earlier session
+        asyncio.create_task(self.claim_available_points(channel))
+
+    async def _send_idle_spade(self, channel: Channel) -> None:
+        if self._idle_spade_failed:
+            return
+        try:
+            succeeded: bool = await channel._send_watch_spade()
+        except (ExitRequest, ReloadRequest):
+            raise
+        except Exception as exc:
+            logger.warning(f"Spade watch event disabled for idle channels: {exc!r}")
+            self._idle_spade_failed = True
+            return
+        if not succeeded:
+            logger.log(CALL, f"Spade watch event failed for idle channel: {channel.name}")
+
+    @task_wrapper
+    async def _idle_loop(self) -> None:
+        idle_channels: list[tuple[Channel, str | None]] = []
+        for entry in self.settings.idle_channels:
+            # "login" or "login:Game name"
+            login, _sep, game_name = entry.partition(':')
+            login = login.strip().lower()
+            if not login:
+                continue
+            response: JsonType = await self.gql_request(
+                GQL_QUERIES["GetStreamInfo"].with_variables({"channel": login})
+            )
+            channel_data: JsonType | None = response["data"]["user"]
+            if channel_data is None:
+                logger.warning(f"Idle channel doesn't exist: {login}")
+                continue
+            channel = Channel(
+                self, id=channel_data["id"], login=login, display_name=channel_data["displayName"]
+            )
+            idle_channels.append((channel, game_name.strip() or None))
+        self._idle_channels = idle_channels
+        if not idle_channels:
+            return
+        logger.info(
+            "Idle channels: " + ", ".join(
+                f"{channel.name} ({game_name or 'any game'})"
+                for channel, game_name in idle_channels
+            )
+        )
+        while True:
+            watching_channel = self.watching_channel.get_with_default(None)
+            if self._state is State.IDLE and (
+                watching_channel is None or self.is_idle_channel(watching_channel)
+            ):
+                for channel, _game in self._idle_channels:
+                    try:
+                        # NOTE: on_channel_update ignores idle channels
+                        await channel.update_stream()
+                    except (ExitRequest, ReloadRequest):
+                        raise
+                    except MinerException as exc:
+                        logger.log(CALL, f"Idle channel check failed for {channel.name}: {exc}")
+                self.update_idle_watching()
+            await asyncio.sleep(IDLE_CHECK_INTERVAL.total_seconds())
+
     @task_wrapper
     async def process_stream_state(self, channel_id: int, message: JsonType):
         msg_type = message["type"]
@@ -1110,6 +1237,9 @@ class Twitch:
 
         NOTE: 'stream_before' gets dealocated once this function finishes.
         """
+        if self.is_idle_channel(channel):
+            # fork: idle channels aren't on the channel list, the idle loop handles them
+            return
         if stream_before is None:
             if stream_after is not None:
                 # Channel going ONLINE
@@ -1231,6 +1361,67 @@ class Twitch:
                         {"input": {"id": data["id"]}}
                     )
                 )
+
+    # fork: channel points
+    def _channel_name(self, channel_id: str | int) -> str:
+        channel_id = int(channel_id)
+        if (channel := self.channels.get(channel_id)) is not None:
+            return channel.name
+        for idle_channel, _game in self._idle_channels:
+            if idle_channel.id == channel_id:
+                return idle_channel.name
+        return str(channel_id)
+
+    @task_wrapper
+    async def process_points(self, user_id: int, message: JsonType):
+        # Message examples:
+        # {"type": "points-earned", "data": {"point_gain": {...}, "balance": {...}}}
+        # {"type": "claim-available", "data": {"claim": {"id": ..., "channel_id": ...}}}
+        msg_type: str = message["type"]
+        if msg_type not in ("points-earned", "claim-available"):
+            return
+        data: JsonType = message["data"]
+        if msg_type == "points-earned":
+            gain: JsonType = data["point_gain"]
+            logger.log(
+                CALL,
+                (
+                    f"Channel points earned on {self._channel_name(gain['channel_id'])}: "
+                    f"+{gain['total_points']} ({gain['reason_code']}), "
+                    f"balance: {data['balance']['balance']}"
+                )
+            )
+        elif msg_type == "claim-available":
+            claim: JsonType = data["claim"]
+            await self.claim_points(claim["channel_id"], claim["id"])
+
+    async def claim_points(self, channel_id: str | int, claim_id: str) -> None:
+        response: JsonType = await self.gql_request(
+            GQL_QUERIES["ClaimCommunityPoints"].with_variables(
+                {"input": {"claimID": claim_id, "channelID": str(channel_id)}}
+            )
+        )
+        result: JsonType | None = response["data"]["claimCommunityPoints"]
+        channel_name = self._channel_name(channel_id)
+        if result is None or result["error"] is not None:
+            error = result and result["error"]
+            logger.warning(f"Channel points bonus claim failed on {channel_name}: {error}")
+            return
+        logger.info(
+            f"Claimed channel points bonus on {channel_name}: "
+            f"+{result['claim']['pointsEarnedTotal']}, balance: {result['currentPoints']}"
+        )
+
+    @task_wrapper
+    async def claim_available_points(self, channel: Channel) -> None:
+        response: JsonType = await self.gql_request(
+            GQL_QUERIES["ChannelPointsContext"].with_variables({"channelLogin": channel._login})
+        )
+        community: JsonType = response["data"]["community"] or {}
+        channel_data: JsonType = community.get("channel") or {}
+        points: JsonType = (channel_data.get("self") or {}).get("communityPoints") or {}
+        if (claim := points.get("availableClaim")) is not None:
+            await self.claim_points(channel.id, claim["id"])
 
     async def get_auth(self) -> _AuthState:
         await self._auth_state.validate()
