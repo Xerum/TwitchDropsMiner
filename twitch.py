@@ -647,6 +647,8 @@ class Twitch:
         if self._idle_task is not None:
             self._idle_task.cancel()
         self._idle_spade_failed = False
+        # NOTE: loaded before the channels fetch, which uses them as well
+        await self._load_idle_channels()
         self._idle_task = asyncio.create_task(self._idle_loop())
         full_cleanup: bool = False
         channels: Final[OrderedDict[int, Channel]] = self.channels
@@ -784,12 +786,18 @@ class Twitch:
                     # for every campaign without an ACL, for it's game,
                     # add a list of live channels with drops enabled
                     new_channels.update(await self.get_live_streams(game, drops_enabled=True))
+                if no_acl:
+                    # fork: idle channels can be mined on too, even outside of the top streams
+                    # NOTE: they're added even when OFFLINE, to notice them going ONLINE
+                    new_channels.update(await self._idle_drop_channels(new_channels))
                 # sort them descending by viewers, by priority and by game priority
                 # NOTE: Viewers sort also ensures ONLINE channels are sorted to the top
                 # NOTE: We can drop using the set now, because there's no more channels being added
                 ordered_channels: list[Channel] = sorted(
                     new_channels, key=self._viewers_key, reverse=True
                 )
+                # fork: idle channels go first among the same game
+                ordered_channels.sort(key=self._idle_rank)
                 ordered_channels.sort(key=lambda ch: ch.acl_based, reverse=True)
                 ordered_channels.sort(key=self.get_priority)
                 # ensure that we won't end up with more channels than we can handle
@@ -876,7 +884,11 @@ class Twitch:
                     # for a switch (including the watching one)
                     # NOTE: we need to sort the channels every time because one channel
                     # can end up streaming any game - channels aren't game-tied
-                    for channel in sorted(channels.values(), key=self.get_priority):
+                    # fork: ACL-based first, then idle channels, like should_switch does
+                    for channel in sorted(
+                        channels.values(),
+                        key=lambda ch: (self.get_priority(ch), not ch.acl_based, self._idle_rank(ch)),
+                    ):
                         if self.should_switch(channel):
                             new_watching = channel
                             break
@@ -1048,7 +1060,12 @@ class Twitch:
         if not self.can_watch(channel):
             return False
         watching_channel = self.watching_channel.get_with_default(None)
-        if watching_channel is None or not self.can_watch(watching_channel):
+        if (
+            watching_channel is None
+            # fork: mining beats watching an idle channel
+            or self.is_idle_channel(watching_channel)
+            or not self.can_watch(watching_channel)
+        ):
             return True
         channel_order = self.get_priority(channel)
         watching_order = self.get_priority(watching_channel)
@@ -1056,8 +1073,13 @@ class Twitch:
             # this channel's game is higher order than the watching one's
             channel_order < watching_order
             or channel_order == watching_order  # or the order is the same
-            # and this channel is ACL-based and the watching channel isn't
-            and channel.acl_based > watching_channel.acl_based
+            and (
+                # and this channel is ACL-based and the watching channel isn't
+                channel.acl_based > watching_channel.acl_based
+                # fork: or both are the same, and this is a preferred idle channel
+                or channel.acl_based == watching_channel.acl_based
+                and self._idle_rank(channel) < self._idle_rank(watching_channel)
+            )
         )
 
     def watch(self, channel: Channel, *, update_status: bool = True):
@@ -1157,8 +1179,7 @@ class Twitch:
         if not succeeded:
             logger.log(CALL, f"Spade watch event failed for idle channel: {channel.name}")
 
-    @task_wrapper
-    async def _idle_loop(self) -> None:
+    async def _load_idle_channels(self) -> None:
         idle_channels: list[tuple[Channel, str | None]] = []
         for entry in self.settings.idle_channels:
             # "login" or "login:Game name"
@@ -1178,14 +1199,52 @@ class Twitch:
             )
             idle_channels.append((channel, game_name.strip() or None))
         self._idle_channels = idle_channels
-        if not idle_channels:
-            return
-        logger.info(
-            "Idle channels: " + ", ".join(
-                f"{channel.name} ({game_name or 'any game'})"
-                for channel, game_name in idle_channels
+        if idle_channels:
+            logger.info(
+                "Idle channels: " + ", ".join(
+                    f"{channel.name} ({game_name or 'any game'})"
+                    for channel, game_name in idle_channels
+                )
             )
-        )
+
+    def _idle_rank(self, channel: Channel) -> int:
+        # the position in the idle channels setting, used to prefer them among the drop channels
+        for rank, (idle_channel, _game) in enumerate(self._idle_channels):
+            if channel.id == idle_channel.id:
+                return rank
+        return len(self._idle_channels)
+
+    def is_idle_drop_channel(self, channel: Channel) -> bool:
+        # an idle channel on the channel list, as opposed to the idle channel object itself
+        return not self.is_idle_channel(channel) and self._idle_rank(channel) < len(self._idle_channels)
+
+    async def _idle_drop_channels(self, known: abc.Iterable[Channel]) -> list[Channel]:
+        known_ids: set[int] = {channel.id for channel in known}
+        drop_channels: list[Channel] = []
+        for idle_channel, _game in self._idle_channels:
+            if idle_channel.id in known_ids:
+                continue
+            # NOTE: a separate object, so that it's mined on like any other channel
+            channel = Channel(
+                self,
+                id=idle_channel.id,
+                login=idle_channel._login,
+                display_name=idle_channel._display_name,
+            )
+            try:
+                # NOTE: this always checks if drops are enabled, see Channel.get_stream
+                channel._stream = await channel.get_stream()
+            except (ExitRequest, ReloadRequest):
+                raise
+            except MinerException as exc:
+                logger.log(CALL, f"Idle channel check failed for {channel.name}: {exc}")
+            drop_channels.append(channel)
+        return drop_channels
+
+    @task_wrapper
+    async def _idle_loop(self) -> None:
+        if not self._idle_channels:
+            return
         while True:
             watching_channel = self.watching_channel.get_with_default(None)
             if self._state is State.IDLE and (
@@ -1282,7 +1341,12 @@ class Twitch:
         else:
             watching_channel = self.watching_channel.get_with_default(None)
             # check if the watching channel was the one updated
-            if watching_channel is not None and watching_channel == channel:
+            # fork: unless it's the idle channel object, that one should be switched from
+            if (
+                watching_channel is not None
+                and watching_channel == channel
+                and not self.is_idle_channel(watching_channel)
+            ):
                 # NOTE: In these cases, channel was the watching channel
                 if not self.can_watch(channel):
                     # we can't watch it anymore

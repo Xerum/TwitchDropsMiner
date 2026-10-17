@@ -360,7 +360,8 @@ class Channel:
         if not channel_data["stream"]:
             return None
         stream = Stream.from_get_stream(self, channel_data)
-        if not stream.drops_enabled:
+        # fork: idle channels aren't from the drops directory, so check them always
+        if not stream.drops_enabled or self._twitch.is_idle_drop_channel(self):
             try:
                 available_drops_campaigns: JsonType = await self._twitch.gql_request(
                     GQL_QUERIES["AvailableDrops"].with_variables({"channelID": str(self.id)})
